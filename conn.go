@@ -4,8 +4,6 @@ package webrtc
 
 import (
 	"fmt"
-	// "runtime"
-	// "strings"
 
 	"github.com/gopherjs/gopherjs/js"
 )
@@ -17,8 +15,8 @@ type Config struct {
 type Conn struct {
 	pc *js.Object
 	
-	ICECandidates      <-chan *ICECandidate
-	ICEConnectionState <-chan ICEConnectionState
+	iceCandidates      <-chan *ICECandidate
+	iceConnectionState <-chan ICEConnectionState
 }
 
 func NewConn(config Config) Conn {
@@ -51,6 +49,131 @@ func NewConn(config Config) Conn {
 	return Conn{pc, iceCandidates, iceConnectionState}
 }
 
+type SignalingChannel interface {
+	Recv() (Message, error)
+	Send(Message) error
+}
+
+type Message struct {
+	SessionDescription *SessionDescription
+	ICECandidate       *ICECandidate
+}
+
+func (c Conn) Negotiate(initiate bool, sig SignalingChannel) error {
+	if initiate {
+		offer, err := c.createOffer()
+		if err != nil {
+			return err
+		}
+		err = c.setLocalDescription(offer)
+		if err != nil {
+			return err
+		}
+		err = sig.Send(Message{SessionDescription: &offer})
+		if err != nil {
+			return err
+		}
+	}
+	messages := make(chan Message)
+	recvErr := make(chan error)
+	// TODO: Don't leak this goroutine (or those sending on other chans), in particular on return err.
+	go func() {
+		needDescription := true
+		needICE := true
+		for needDescription || needICE {
+			m, err := sig.Recv()
+			if err != nil {
+				recvErr <- err
+				return
+			}
+			messages <- m
+			if m.SessionDescription != nil {
+				if m.SessionDescription.Type != ProvisionalAnswer {
+					needDescription = false
+				}
+			} else if m.ICECandidate == nil {
+				needICE = false
+			}
+		}
+		close(messages)
+	}()
+	localICECandidates := c.iceCandidates
+	var state ICEConnectionState
+	for {
+		select {
+		case ic := <-localICECandidates:
+			fmt.Println("sending", ic)
+			err := sig.Send(Message{ICECandidate: ic})
+			if err != nil {
+				return err
+			}
+			if ic == nil {
+				localICECandidates = nil
+				if messages == nil {
+					goto done
+				}
+			}
+		case m, ok := <-messages:
+			if !ok {
+				messages = nil
+				if localICECandidates == nil {
+					goto done
+				}
+			}
+			if m.SessionDescription != nil {
+				fmt.Println("received", m.SessionDescription.Type)
+				err := c.setRemoteDescription(*m.SessionDescription)
+				if err != nil {
+					return err
+				}
+				if !initiate {
+					answer, err := c.createAnswer()
+					if err != nil {
+						return err
+					}
+					err = c.setLocalDescription(answer)
+					if err != nil {
+						return err
+					}
+					err = sig.Send(Message{SessionDescription: &answer})
+					if err != nil {
+						return err
+					}
+				}
+			} else if m.ICECandidate != nil {
+				fmt.Println("received", m.ICECandidate)
+				err := c.addRemoteICECandidate(*m.ICECandidate)
+				if err != nil {
+					return err
+				}
+			}
+		case err := <-recvErr:
+			return err
+		case state = <-c.iceConnectionState:
+			// Don't return yet on Connected because we may still be gathering candidates.
+			if state.Failed() {
+				return fmt.Errorf("negotiation failed")
+			}
+		}
+	}
+
+done:
+	// Completed is not yet reliably reported, so settle for Connected.
+	if state.Connected() || state.Completed() {
+		return nil
+	}
+	for state := range c.iceConnectionState {
+		fmt.Println("ICE connection state:", state)
+		switch {
+		case state.Failed():
+			return fmt.Errorf("negotiation failed")
+		case state.Connected(), state.Completed():
+			return nil
+		}
+	}
+	panic("unreachable")
+}
+
 func (c Conn) Close() {
 	c.pc.Call("close")
 }
@@ -69,7 +192,7 @@ func (c ICECandidate) toJS() *js.Object {
 	})
 }
 
-func (c Conn) AddICECandidate(cand ICECandidate) error {
+func (c Conn) addRemoteICECandidate(cand ICECandidate) error {
 	err := make(chan error)
 	c.pc.Call("addIceCandidate", cand.toJS(), func() {
 		err <- nil
@@ -89,120 +212,14 @@ func (s ICEConnectionState) Failed() bool { return s == "failed" }
 func (s ICEConnectionState) Disconnected() bool { return s == "disconnected" }
 func (s ICEConnectionState) Closed() bool { return s == "closed" }
 
-type DataChannel struct {
-	dc *js.Object
+func (c Conn) createOffer() (offer SessionDescription, err error)   { return c.createSessionDescription(Offer) }
+func (c Conn) createAnswer() (answer SessionDescription, err error) { return c.createSessionDescription(Answer) }
 
-	open  chan struct{}
-	recv  chan string
-	close chan struct{}
-}
-
-type DataChannelOption struct {
-	apply func(js.M)
-}
-
-var Unordered = DataChannelOption{func(m js.M) { m["ordered"] = false }}
-
-func MaxPacketLifeTime(t uint16) DataChannelOption {
-	return DataChannelOption{func(m js.M) { m["maxPacketLifeTime"] = t }}
-}
-func MaxRetransmits(r uint16) DataChannelOption {
-	return DataChannelOption{func(m js.M) { m["maxRetransmits"] = r }}
-}
-func Protocol(p string) DataChannelOption {
-	return DataChannelOption{func(m js.M) { m["protocol"] = p }}
-}
-func Negotiated(id uint16) DataChannelOption {
-	return DataChannelOption{func(m js.M) {
-		m["negotiated"] = true
-		m["id"] = id
-	}}
-}
-
-func (c Conn) CreateDataChannel(label string, options ...DataChannelOption) DataChannel {
-	init := js.M{}
-	for _, opt := range options {
-		opt.apply(init)
-	}
-	dc := c.pc.Call("createDataChannel", label, init)
-	open := make(chan struct{})
-	recv := make(chan string, 10)
-	clos := make(chan struct{})
-	dc.Set("onopen", func() {
-		close(open)
-	})
-	dc.Set("onmessage", func(e *js.Object) {
-		recv <- e.Get("data").String()
-	})
-	dc.Set("onclose", func() {
-		// defer catchCloseOfClosedChannel()
-		close(clos)
-	})
-	return DataChannel{dc, open, recv, clos}
-}
-
-func (d DataChannel) SendString(s string) (err error) {
-	if s == "" {
-		panic("cannot send empty string (WebRTC bug?)")
-	}
-	defer func() {
-		x := recover()
-		if x == nil {
-			return
-		}
-		if jsErr, ok := x.(*js.Error); ok && jsErr != nil {
-			err = jsErr
-		} else {
-			panic(x)
-		}
-	}()
-
-	select {
-	case <-d.open:
-	case <-d.close:
-		return fmt.Errorf("DataChannel is closed")
-	}
-	d.dc.Call("send", s)
-	return
-}
-
-func (d DataChannel) Recv() (string, error) {
-	// Prioritize recv over close.
-	select {
-	case s := <-d.recv:
-		return s, nil
-	default:
-	}
-
-	select {
-	case s := <-d.recv:
-		return s, nil
-	case <-d.close:
-		return "", fmt.Errorf("DataChannel is closed")
-	}
-}
-
-func (d DataChannel) Close() {
-	d.dc.Call("close")
-
-	// seems unnecessary, but keep it for awhile just in case
-	// defer catchCloseOfClosedChannel()
-	// close(d.close)
-}
-
-func catchCloseOfClosedChannel() {
-	// if x := recover(); x != nil {
-	// 	if err, ok := x.(runtime.Error); !ok || !strings.Contains(err.Error(), "close of closed channel") {
-	// 		panic(x)
-	// 	}
-	// }
-}
-
-func (c Conn) CreateOffer() (offer SessionDescription, err error) {
+func (c Conn) createSessionDescription(typ SessionDescriptionType) (d SessionDescription, err error) {
 	done := make(chan int)
-	c.pc.Call("createOffer", func(offer_ *js.Object) {
-		offer.Type = Offer
-		offer.SDP = offer_.Get("sdp").String()
+	c.pc.Call("create" + string(typ), func(d_ *js.Object) {
+		d.Type = typ
+		d.SDP = d_.Get("sdp").String()
 		close(done)
 	}, func(err_ *js.Object) {
 		err = errorFromJS(err_)
@@ -212,33 +229,12 @@ func (c Conn) CreateOffer() (offer SessionDescription, err error) {
 	return
 }
 
-func (c Conn) CreateAnswer() (answer SessionDescription, err error) {
-	done := make(chan int)
-	c.pc.Call("createAnswer", func(answer_ *js.Object) {
-		answer.Type = Answer
-		answer.SDP = answer_.Get("sdp").String()
-		close(done)
-	}, func(err_ *js.Object) {
-		err = errorFromJS(err_)
-		close(done)
-	})
-	<-done
-	return
-}
+func (c Conn) setLocalDescription(d SessionDescription) error  { return c.setDescription("Local", d) }
+func (c Conn) setRemoteDescription(d SessionDescription) error { return c.setDescription("Remote", d) }
 
-func (c Conn) SetLocalDescription(desc SessionDescription) error {
+func (c Conn) setDescription(localRemote string, d SessionDescription) error {
 	err := make(chan error)
-	c.pc.Call("setLocalDescription", desc.toJS(), func() {
-		err <- nil
-	}, func(err_ *js.Object) {
-		err <- errorFromJS(err_)
-	})
-	return <-err
-}
-
-func (c Conn) SetRemoteDescription(desc SessionDescription) error {
-	err := make(chan error)
-	c.pc.Call("setRemoteDescription", desc.toJS(), func() {
+	c.pc.Call("set" + localRemote + "Description", d.toJS(), func() {
 		err <- nil
 	}, func(err_ *js.Object) {
 		err <- errorFromJS(err_)
@@ -262,15 +258,7 @@ func (d SessionDescription) toJS() *js.Object {
 	})
 }
 
-type SessionDescriptionType byte
-
-func (t SessionDescriptionType) String() string {
-	return map[SessionDescriptionType]string{
-		Offer:             "Offer",
-		ProvisionalAnswer: "ProvisionalAnswer",
-		Answer:            "Answer",
-	}[t]
-}
+type SessionDescriptionType string
 
 func (t SessionDescriptionType) toJS() string {
 	return map[SessionDescriptionType]string{
@@ -281,10 +269,9 @@ func (t SessionDescriptionType) toJS() string {
 }
 
 const (
-	_ SessionDescriptionType = iota
-	Offer
-	ProvisionalAnswer
-	Answer
+	Offer SessionDescriptionType = "Offer"
+	ProvisionalAnswer            = "ProvisionalAnswer"
+	Answer                       = "Answer"
 )
 
 func getType(name string) *js.Object {
