@@ -46,6 +46,14 @@ func NewConn(config Config) Conn {
 	// pc.Set("onaddstream", func(e *js.Object) {
 	//     fmt.Println("stream added:", e)
 	// })
+
+	// In Firefox, a DataChannel apparently doesn't hold a strong references to its PeerConnection, so we must.
+	if js.Global.Get("keepMeAlive") == js.Undefined {
+		js.Global.Set("keepMeAlive", js.S{})
+	}
+	keepMeAlive := js.Global.Get("keepMeAlive")
+	keepMeAlive.SetIndex(keepMeAlive.Length(), pc)
+
 	return Conn{pc, iceCandidates, iceConnectionState}
 }
 
